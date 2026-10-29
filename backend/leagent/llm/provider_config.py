@@ -595,8 +595,15 @@ class ProviderConfigService:
 
         existing = providers[idx]
         for key in ("api_key", "base_url", "models", "enabled", "timeout", "metadata", "type"):
-            if key in data:
-                existing[key] = data[key]
+            if key not in data:
+                continue
+            value = data[key]
+            # Never persist the masked sentinel ("***"); treat blank/None as "keep existing".
+            if key == "api_key" and (
+                value is None or not str(value).strip() or str(value).strip() == "***"
+            ):
+                continue
+            existing[key] = value
 
         if existing.get("type") == "deepseek" and existing.get("base_url"):
             from leagent.llm.providers.deepseek_utils import normalize_deepseek_base_url
@@ -742,6 +749,33 @@ class ProviderConfigService:
 
     # -- test connectivity ---------------------------------------------------
 
+    def _maybe_rebuild_provider(self, name: str, pc: ProviderConfig) -> None:
+        """Re-register *pc* from the persisted config if it diverges from the live instance.
+
+        The running LLMService is rebuilt from ``providers.yaml`` on every provider
+        change (see ``ServiceManager.reload_llm_service``). To keep connectivity
+        probes honest, the in-memory provider used for testing must match that
+        persisted config — otherwise a probe can report "healthy" using a stale
+        in-memory credential while the live service would fail with an invalid API
+        key. When the config is unchanged we keep the existing instance (and its
+        circuit-breaker state) intact.
+        """
+        persisted_sig = (
+            self._resolve_api_key(pc.api_key or "").strip(),
+            (pc.base_url or "").strip(),
+        )
+        if not self._registry.has_provider(name):
+            self._register_single(pc)
+            return
+        live = self._registry.get_provider_info(name).provider
+        live_sig = (
+            str(getattr(live, "api_key", "") or "").strip(),
+            str(getattr(live, "base_url", "") or "").strip(),
+        )
+        if persisted_sig != live_sig:
+            self._registry.unregister(name)
+            self._register_single(pc)
+
     async def test_provider(self, name: str, model: str | None = None) -> HealthCheckResult:
         pc = self.get_provider(name)
         if not pc:
@@ -749,12 +783,11 @@ class ProviderConfigService:
                 provider_name=name, is_healthy=False, error=f"Provider '{name}' not found"
             )
 
+        self._maybe_rebuild_provider(name, pc)
         if not self._registry.has_provider(name):
-            self._register_single(pc)
-            if not self._registry.has_provider(name):
-                return HealthCheckResult(
-                    provider_name=name, is_healthy=False, error="Failed to instantiate provider"
-                )
+            return HealthCheckResult(
+                provider_name=name, is_healthy=False, error="Failed to instantiate provider"
+            )
 
         info = self._registry.get_provider_info(name)
         test_config = pc.metadata.get("test_config") if isinstance(pc.metadata, dict) else {}
